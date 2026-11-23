@@ -36,10 +36,13 @@ import { initR2Client } from './src/services/storage.ts';
 import { enqueueDocumentJob, startQueueWorker, closeQueue } from './src/queue/documentQueue.ts';
 import {
   CREDIT_PACKAGES,
-  initiateSimulinkPayStkPush,
+  initiateStkPush,
   isSimulinkPayConfigured,
   normalizeKenyanPhone,
   verifySimulinkPayWebhookSignature,
+  parseSimulinkPayWebhook,
+  SimulinkPayWebhookEvent,
+  SimulinkPayError,
 } from './src/services/simulinkpay.ts';
 
 dotenv.config();
@@ -655,7 +658,7 @@ app.post('/api/payments/initiate', requireAuth, async (req: AuthRequest, res: Re
     const paymentRecord = await createPaymentRecord({
       userId: user.id,
       documentId: validDocId,
-      amountCents: pkg.amountCents,
+      amountCents: pkg.amountKes * 100, // Convert KES to cents
       creditsPurchased: pkg.credits,
       currency: 'KES',
       phoneNumber: normalizedPhone,
@@ -664,15 +667,15 @@ app.post('/api/payments/initiate', requireAuth, async (req: AuthRequest, res: Re
     });
 
     try {
-      const stk = await initiateSimulinkPayStkPush({
-        paymentId: paymentRecord.id,
-        phoneNumber: normalizedPhone,
+      const stk = await initiateStkPush({
         amountKes: pkg.amountKes,
+        phoneNumber: normalizedPhone,
         reference,
         description: paymentRecord.description || pkg.name,
+        feeBearer: 'merchant',
       });
 
-      const updated = await attachGatewayTransaction(paymentRecord.id, stk.transactionId, stk.rawResponse);
+      const updated = await attachGatewayTransaction(paymentRecord.id, String(stk.paymentId), stk.rawResponse as unknown as Record<string, unknown>);
       res.status(201).json({
         payment: updated ?? paymentRecord,
         message: `M-Pesa STK push sent to +${normalizedPhone}. Confirm on your handset to receive ${pkg.credits} credits.`,
@@ -681,7 +684,21 @@ app.post('/api/payments/initiate', requireAuth, async (req: AuthRequest, res: Re
       const msg =
         gatewayError instanceof Error ? gatewayError.message : 'SimulinkPay STK Push failed.';
       await markPaymentFailed(paymentRecord.id, { error: msg });
-      res.status(502).json({ error: msg });
+      if (gatewayError instanceof SimulinkPayError) {
+        if (gatewayError.statusCode === 402) {
+          res.status(402).json({ error: msg });
+        } else if (gatewayError.statusCode === 422) {
+          res.status(422).json({ error: msg });
+        } else if (gatewayError.statusCode === 403) {
+          res.status(403).json({ error: msg });
+        } else if (gatewayError.statusCode === 503) {
+          res.status(503).json({ error: msg });
+        } else {
+          res.status(502).json({ error: msg });
+        }
+      } else {
+        res.status(502).json({ error: msg });
+      }
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Failed to initiate payment.';
@@ -700,31 +717,25 @@ app.post('/api/payments/callback', async (req: Request, res: Response) => {
       return;
     }
 
-    const payload = req.body as Record<string, unknown>;
-    const ref =
-      (typeof payload.external_id === 'string' && payload.external_id) ||
-      (typeof payload.reference === 'string' && payload.reference) ||
-      (typeof payload.transaction_id === 'string' && payload.transaction_id) ||
-      '';
-
-    if (!ref) {
-      res.status(400).json({ error: 'Missing payment reference in webhook payload.' });
+    let webhookEvent: SimulinkPayWebhookEvent;
+    try {
+      webhookEvent = parseSimulinkPayWebhook(rawBody.toString());
+    } catch {
+      res.status(400).json({ error: 'Invalid webhook payload.' });
       return;
     }
 
-    const rawStatus = String(payload.status || '').toLowerCase();
-    const status =
-      rawStatus === 'completed' || rawStatus === 'success' || rawStatus === 'paid'
-        ? 'completed'
-        : 'failed';
+    const payment = webhookEvent.payment;
+    const status = webhookEvent.type === 'payment.succeeded' ? 'completed' : 'failed';
 
-    const txId = typeof payload.transaction_id === 'string' ? payload.transaction_id : undefined;
+    const ref = payment.reference || String(payment.id);
+    const txId = payment.receipt_number ?? undefined;
 
     const result = await reconcilePaymentWebhook({
       referenceOrExternalId: ref,
       status,
       transactionId: txId,
-      metadata: payload,
+      metadata: { webhookEvent },
     });
 
     if (!result.found) {

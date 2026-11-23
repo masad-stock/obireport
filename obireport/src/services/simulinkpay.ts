@@ -1,4 +1,7 @@
 import crypto from 'node:crypto';
+import { v4 as uuidv4 } from 'uuid';
+
+const SIMULINKPAY_BASE_URL = 'https://simulinkpay.co.ke/api/v1';
 
 export interface CreditPackage {
   id: string;
@@ -6,7 +9,6 @@ export interface CreditPackage {
   audience: string;
   credits: number;
   amountKes: number;
-  amountCents: number;
   perCheckKes: number;
   features: string[];
 }
@@ -18,7 +20,6 @@ export const CREDIT_PACKAGES: CreditPackage[] = [
     audience: 'For individual assignments',
     credits: 1,
     amountKes: 150,
-    amountCents: 15000,
     perCheckKes: 150,
     features: ['1 full similarity & AI report', 'PDF verification certificate', 'Up to 50 MB PDF, DOCX, or TXT'],
   },
@@ -28,7 +29,6 @@ export const CREDIT_PACKAGES: CreditPackage[] = [
     audience: 'For thesis & dissertation drafts',
     credits: 5,
     amountKes: 650,
-    amountCents: 65000,
     perCheckKes: 130,
     features: ['5 report credits (KES 130/check)', 'Section-by-section breakdown', 'Priority queue & archival'],
   },
@@ -38,14 +38,42 @@ export const CREDIT_PACKAGES: CreditPackage[] = [
     audience: 'For academic labs & editorial teams',
     credits: 15,
     amountKes: 1650,
-    amountCents: 165000,
     perCheckKes: 110,
     features: ['15 report credits (KES 110/check)', 'Multi-draft revision history', 'Full PDF report exports'],
   },
 ];
 
+export interface SimulinkPayConfig {
+  apiToken: string;
+  receivingAccountId: number;
+  webhookSecret: string;
+}
+
+function getConfig(): SimulinkPayConfig {
+  const apiToken = process.env.SIMULINKPAY_API_TOKEN?.trim();
+  const receivingAccountId = Number(process.env.SIMULINKPAY_RECEIVING_ACCOUNT_ID?.trim());
+  const webhookSecret = process.env.SIMULINKPAY_WEBHOOK_SECRET?.trim();
+
+  if (!apiToken) {
+    throw new Error('SIMULINKPAY_API_TOKEN is not configured');
+  }
+  if (!receivingAccountId || Number.isNaN(receivingAccountId)) {
+    throw new Error('SIMULINKPAY_RECEIVING_ACCOUNT_ID is not configured or invalid');
+  }
+  if (!webhookSecret) {
+    throw new Error('SIMULINKPAY_WEBHOOK_SECRET is not configured');
+  }
+
+  return { apiToken, receivingAccountId, webhookSecret };
+}
+
 export function isSimulinkPayConfigured(): boolean {
-  return Boolean(process.env.SIMULINKPAY_API_URL?.trim() && process.env.SIMULINKPAY_API_KEY?.trim());
+  try {
+    getConfig();
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export function normalizeKenyanPhone(phone: string): string | null {
@@ -62,83 +90,180 @@ export function normalizeKenyanPhone(phone: string): string | null {
   return null;
 }
 
-export interface StkPushResult {
-  transactionId: string;
-  checkoutRequestId?: string;
-  rawResponse: Record<string, unknown>;
+export interface SimulinkPayPaymentResponse {
+  id: number;
+  status: 'pending' | 'succeeded' | 'failed';
+  amount: number;
+  fee_bearer: 'merchant' | 'payer' | 'shared';
+  payer_fee: number;
+  amount_charged: number;
+  currency: 'KES';
+  payment_link_id: number | null;
+  reference: string | null;
+  receipt_number: string | null;
+  created_at: string;
+  completed_at: string | null;
 }
 
-export async function initiateSimulinkPayStkPush(params: {
-  paymentId: string;
-  phoneNumber: string;
-  amountKes: number;
-  reference: string;
-  description: string;
-}): Promise<StkPushResult> {
-  const apiUrl = process.env.SIMULINKPAY_API_URL?.trim().replace(/\/+$/, '');
-  const apiKey = process.env.SIMULINKPAY_API_KEY?.trim();
+export interface StkPushResult {
+  paymentId: number;
+  paymentStatus: 'pending' | 'succeeded' | 'failed';
+  amountCharged: number;
+  rawResponse: SimulinkPayPaymentResponse;
+}
 
-  if (!apiUrl || !apiKey) {
-    throw new Error(
-      'SimulinkPay API credentials (SIMULINKPAY_API_URL, SIMULINKPAY_API_KEY) are not configured in server secrets.'
-    );
-  }
+export interface FeesQuoteResponse {
+  amount: number;
+  fee_bearer: 'merchant' | 'payer' | 'shared';
+  fee: number;
+  payer_fee: number;
+  amount_charged: number;
+  currency: 'KES';
+}
 
-  const appUrl = process.env.APP_URL?.trim().replace(/\/+$/, '') || '';
-  const callbackUrl = appUrl ? `${appUrl}/api/payments/callback` : undefined;
+export interface WalletResponse {
+  balance: number;
+  currency: 'KES';
+}
 
-  const response = await fetch(`${apiUrl}/v1/payments/stk-push`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      phone_number: params.phoneNumber,
-      amount: params.amountKes,
-      currency: 'KES',
-      reference: params.reference,
-      external_id: params.paymentId,
-      description: params.description,
-      callback_url: callbackUrl,
-    }),
+export interface WalletTopupResponse {
+  id: number;
+  status: 'pending' | 'succeeded' | 'failed';
+  amount: number;
+  currency: 'KES';
+  created_at: string;
+  completed_at: string | null;
+}
+
+async function simulinkPayFetch<T>(
+  path: string,
+  options: RequestInit = {}
+): Promise<T> {
+  const { apiToken } = getConfig();
+  const url = `${SIMULINKPAY_BASE_URL}${path}`;
+
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${apiToken}`,
+    'Content-Type': 'application/json',
+    ...(options.headers as Record<string, string>),
+  };
+
+  const response = await fetch(url, {
+    ...options,
+    headers,
   });
 
-  const payload = (await response.json().catch(() => ({}))) as Record<string, unknown>;
-  if (!response.ok) {
-    const msg =
-      typeof payload.message === 'string'
-        ? payload.message
-        : `SimulinkPay gateway returned status ${response.status}`;
-    throw new Error(msg);
+  const rawText = await response.text();
+  let payload: Record<string, unknown> = {};
+  try {
+    payload = JSON.parse(rawText) as Record<string, unknown>;
+  } catch {
+    // Non-JSON response
   }
 
-  const txId =
-    (typeof payload.transaction_id === 'string' && payload.transaction_id) ||
-    (typeof payload.checkout_request_id === 'string' && payload.checkout_request_id) ||
-    params.reference;
+  if (!response.ok) {
+    const errorType = (payload.error as { type?: string })?.type;
+    const errorMessage = (payload.error as { message?: string })?.message;
+    const errorParam = (payload.error as { param?: string })?.param;
+
+    const error = new SimulinkPayError(
+      errorMessage || `SimulinkPay API error: ${response.status}`,
+      response.status,
+      errorType,
+      errorParam
+    );
+    throw error;
+  }
+
+  return payload as T;
+}
+
+export class SimulinkPayError extends Error {
+  constructor(
+    message: string,
+    public readonly statusCode: number,
+    public readonly errorType?: string,
+    public readonly param?: string
+  ) {
+    super(message);
+    this.name = 'SimulinkPayError';
+  }
+}
+
+export async function getFeesQuote(amount: number): Promise<FeesQuoteResponse> {
+  if (amount < 1 || amount > 150000) {
+    throw new Error('Amount must be between 1 and 150,000 KES');
+  }
+  return simulinkPayFetch<FeesQuoteResponse>(`/fees/quote?amount=${amount}`);
+}
+
+export async function getWalletBalance(): Promise<WalletResponse> {
+  return simulinkPayFetch<WalletResponse>('/wallet');
+}
+
+export async function topUpWallet(amount: number, idempotencyKey: string): Promise<WalletTopupResponse> {
+  return simulinkPayFetch<WalletTopupResponse>('/wallet/topups', {
+    method: 'POST',
+    headers: {
+      'Idempotency-Key': idempotencyKey,
+    },
+    body: JSON.stringify({ amount }),
+  });
+}
+
+export async function getWalletTopupStatus(topupId: number): Promise<WalletTopupResponse> {
+  return simulinkPayFetch<WalletTopupResponse>(`/wallet/topups/${topupId}`);
+}
+
+export async function initiateStkPush(params: {
+  amountKes: number;
+  phoneNumber: string;
+  reference: string;
+  description: string;
+  feeBearer?: 'merchant' | 'payer' | 'shared';
+}): Promise<StkPushResult> {
+  const { receivingAccountId } = getConfig();
+  const idempotencyKey = uuidv4();
+
+  const body = {
+    receiving_account_id: receivingAccountId,
+    amount: params.amountKes,
+    customer_phone: params.phoneNumber,
+    reference: params.reference,
+    currency: 'KES',
+    fee_bearer: params.feeBearer ?? 'merchant',
+  };
+
+  const payment = await simulinkPayFetch<SimulinkPayPaymentResponse>('/payments', {
+    method: 'POST',
+    headers: {
+      'Idempotency-Key': idempotencyKey,
+    },
+    body: JSON.stringify(body),
+  });
 
   return {
-    transactionId: txId,
-    checkoutRequestId:
-      typeof payload.checkout_request_id === 'string' ? payload.checkout_request_id : undefined,
-    rawResponse: payload,
+    paymentId: payment.id,
+    paymentStatus: payment.status,
+    amountCharged: payment.amount_charged,
+    rawResponse: payment,
   };
+}
+
+export async function getPaymentStatus(paymentId: number): Promise<SimulinkPayPaymentResponse> {
+  return simulinkPayFetch<SimulinkPayPaymentResponse>(`/payments/${paymentId}`);
 }
 
 export function verifySimulinkPayWebhookSignature(
   rawBody: Buffer | string,
   signatureHeader: string | undefined
 ): boolean {
-  const secret = process.env.SIMULINKPAY_WEBHOOK_SECRET?.trim();
-  if (!secret) {
-    return false;
-  }
-  if (!signatureHeader) {
+  const { webhookSecret } = getConfig();
+  if (!webhookSecret || !signatureHeader) {
     return false;
   }
 
-  const expectedHex = crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
+  const expectedHex = crypto.createHmac('sha256', webhookSecret).update(rawBody).digest('hex');
   const providedHex = signatureHeader.replace(/^sha256=/i, '').trim();
 
   const expectedBuf = Buffer.from(expectedHex, 'utf8');
@@ -149,4 +274,15 @@ export function verifySimulinkPayWebhookSignature(
   }
 
   return crypto.timingSafeEqual(expectedBuf, providedBuf);
+}
+
+export interface SimulinkPayWebhookEvent {
+  id: number;
+  type: 'payment.succeeded' | 'payment.failed' | 'payment.pending';
+  payment: SimulinkPayPaymentResponse;
+}
+
+export function parseSimulinkPayWebhook(body: string): SimulinkPayWebhookEvent {
+  const parsed = JSON.parse(body) as SimulinkPayWebhookEvent;
+  return parsed;
 }
