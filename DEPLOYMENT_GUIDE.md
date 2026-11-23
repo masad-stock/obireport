@@ -131,9 +131,10 @@ R2_PUBLIC_URL=https://files.yourdomain.com  # optional
 TURNITIN_API_URL=https://api.turnitin.com
 TURNITIN_API_KEY=your-turnitin-api-key
 
-# SimulinkPay
-SIMULINKPAY_API_URL=https://api.simulinkpay.com
-SIMULINKPAY_API_KEY=your-simulinkpay-key
+# SimulinkPay (M-Pesa STK Push)
+# Base URL is fixed: https://simulinkpay.co.ke/api/v1
+SIMULINKPAY_API_TOKEN=your-simulinkpay-api-token
+SIMULINKPAY_RECEIVING_ACCOUNT_ID=123
 SIMULINKPAY_WEBHOOK_SECRET=your-webhook-secret
 
 # Email (Resend)
@@ -264,15 +265,24 @@ curl -X POST https://api.resend.com/emails \
 ## Step 7: Configure SimulinkPay
 
 ### 7.1 Get Credentials
-From SimulinkPay dashboard:
-- `SIMULINKPAY_API_URL`
-- `SIMULINKPAY_API_KEY`
-- `SIMULINKPAY_WEBHOOK_SECRET`
+From SimulinkPay Merchant Portal → Developer → API tokens:
+- `SIMULINKPAY_API_TOKEN` — API token (sandbox or live)
+- `SIMULINKPAY_RECEIVING_ACCOUNT_ID` — **Must be a VERIFIED receiving account** (verify in dashboard first)
+- `SIMULINKPAY_WEBHOOK_SECRET` — Signing secret shown once when creating webhook endpoint
 
 ### 7.2 Configure Webhook URL
-In SimulinkPay dashboard → Webhooks:
+In SimulinkPay dashboard → Developer → Webhooks:
 - URL: `https://your-backend.railway.app/api/payments/callback`
-- Events: `payment.completed`, `payment.failed`
+- Events: `payment.succeeded`, `payment.failed`, `payment.pending`
+
+### 7.3 Verify Receiving Account
+Before accepting payments, ensure the receiving account is **verified** in the SimulinkPay dashboard. An unverified account will cause `422 receiving_account_unverified` errors.
+
+### 7.4 Fund the Wallet
+SimulinkPay fees are deducted from a prepaid wallet (not from customer payments).
+1. Check balance: `GET /wallet` via API
+2. Top up: `POST /wallet/topups` with `Idempotency-Key`
+3. If wallet balance is insufficient, payments are rejected with `402 insufficient_wallet_balance`
 
 ---
 
