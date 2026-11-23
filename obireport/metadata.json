@@ -1,0 +1,6 @@
+{
+  "name": "ObiReport",
+  "description": "Academic similarity and AI detection platform for manuscript verification, detailed forensic reporting, PDF exports, and pay-per-check M-Pesa billing.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
